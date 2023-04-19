@@ -3,9 +3,11 @@ from typer import Typer
 
 console = config.console
 
-app = Typer()
+app = Typer(rich_markup_mode="markdown")
 
 
-@app.command()
+@app.callback(invoke_without_command=True)
 def firewall_main():
-    console.print("Entered firewall main")
+    console.print(
+        f":construction: WIP :construction: Entered Firewall main - this section is WIP"
+    )
