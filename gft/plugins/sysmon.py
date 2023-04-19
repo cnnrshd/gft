@@ -1,5 +1,7 @@
+import json
 import logging
 from dataclasses import dataclass, field
+from re import compile, match
 
 from config import config
 from lxml import etree
@@ -11,27 +13,100 @@ console = config.console
 app = Typer(rich_markup_mode="markdown")
 
 
-@app.callback(invoke_without_command=True)
-def main():
-    console.print("Entered sysmon_main")
+# Event lookup list - no hashing required.
+EVENT_LOOKUP = [
+    None,  # 0 (not a valid Event ID)
+    "ProcessCreate",
+    "FileCreateTime",
+    "NetworkConnect",
+    None,  # 4 (Sysmon service state change, cannot be filtered)
+    "ProcessTerminate",
+    "DriverLoad",
+    "ImageLoad",
+    "CreateRemoteThread",
+    "RawAccessRead",
+    "ProcessAccess",
+    "FileCreate",
+    "RegistryEvent",
+    "RegistryEvent",
+    "RegistryEvent",
+    "FileCreateStreamHash",
+    None,  # 16 (Sysmon configuration change, cannot be filtered)
+    "PipeEvent",
+    "PipeEvent",
+    "WmiEvent",
+    "WmiEvent",
+    "WmiEvent",
+    "DnsQuery",
+    "FileDelete",
+    "ClipboardChange",
+    "ProcessTampering",
+    "FileDeleteDetected",
+    "FileBlockExecutable",
+    "FileBlockShredding",
+]
 
 
 @dataclass
 class Filter:
-    field: str
-    name: str
-    condition: str
-    value: str
+    field: str  # ex. Image - used for lookup
+    name: str  # ex. "technique_id=T1055"
+    condition: str  # ex. "begin with"
+    value: str  # ex. "C:\Temp" - what is filtered
+
+    def passes(self, event: dict) -> bool:
+        # event is a dict holding Sysmon event field and values
+        # name is not needed
+        # condition changes logic
+        if self.condition == "is":
+            return event.get(self.field) == self.value
+        elif self.condition == "is any":
+            return event.get(self.field) in self.value.split(";")
+        elif self.condition == "is not":
+            return not (event.get(self.field) == self.value)
+        elif self.condition == "contains":
+            return self.value in event.get(self.field)
+        elif self.condition == "contains any":
+            return any(val in event.get(self.field) for val in self.value.split(";"))
+        elif self.condition == "contains all":
+            return all(val in event.get(self.field) for val in self.value.split(";"))
+        elif self.condition == "excludes":
+            return self.value not in event.get(self.field)
+        elif self.condition == "excludes any":
+            return not any(
+                val in event.get(self.field) for val in self.value.split(";")
+            )
+        elif self.condition == "excludes all":
+            return all(
+                val not in event.get(self.field) for val in self.value.split(";")
+            )
+        elif self.condition == "begin with":
+            return event.get(self.field).startswith(self.value)
+        elif self.condition == "end with":
+            return event.get(self.field).endswith(self.value)
+        elif self.condition == "not begin with":
+            return not event.get(self.field).startswith(self.value)
+        elif self.condition == "not end with":
+            return not event.get(self.field).endswith(self.value)
+        elif self.condition == "less than":
+            return self.value < event.get(self.field)
+        elif self.condition == "more than":
+            return self.value > event.get(self.field)
+        elif self.condition == "image":
+            return self.value == event.get(self.field).split("\\")[-1]
+        else:
+            raise ValueError(f"Invalid value for Filter.condition: {self.condition}")
 
 
 def _parse_filter_element(elem: Element) -> Filter:
     attribute_dict = dict(elem.attrib)
     field = elem.tag
     value = elem.text
+    condition = attribute_dict.get("condition", "is")
     return Filter(
         field=field,
         name=attribute_dict.get("name", ""),
-        condition=attribute_dict.get("condition"),
+        condition=condition,
         value=value,
     )
 
@@ -42,10 +117,11 @@ class Rule:
     event_type: str  # ex. ImageLoad, ProcessCreate
     onmatch: str  # include or exclude
     number: int  # tracks the order of rules
+    name: str  # name of rule or filter
     filters: list[Filter] = field(default_factory=list)
 
     def passes(self, event: dict) -> bool:
-        """A filter fuction that determines if a provided event would pass this rule
+        """A filter function that determines if a provided event would pass this rule
         Note that "passing" is relative. This means being included by an include and
         being excluded by an exclude.
 
@@ -55,10 +131,25 @@ class Rule:
         Returns:
             bool: True if the event would pass the filter(s)
         """
-        return True
+        if self.filter_relation == "or":
+            return any(f.passes(event) for f in self.filters)
+        return all(f.passes(event) for f in self.filters)
 
 
 def _extract_sysmon_rules(config: FileText) -> dict:
+    """Extracts sysmon rules, ensuring that they are numbered in order of precedence
+
+    Args:
+        config (FileText): A valid Sysmon Config
+
+    Returns:
+        dict: A dictionary with keys (EventType,FilterType) and values [Rule] - ex:
+                {("CreateRemoteThread","include") : [Rule(filter_relation='or', event_type='CreateRemoteThread',
+                    onmatch='include', number=1, filters=[Filter(field='SourceImage',
+                    name='technique_id=T1055,technique_name=Process Injection', condition='begin with'
+                    , value='C:\\')]]
+                }
+    """
     tree: ElementTree = etree.parse(
         config, parser=etree.XMLParser(remove_blank_text=True, remove_comments=True)
     )
@@ -73,7 +164,8 @@ def _extract_sysmon_rules(config: FileText) -> dict:
             logging.debug(f"Working with {event_type} {onmatch}")
             for rule_number, filter in enumerate(event, start=1):
                 if filter.tag == "Rule":
-                    logging.debug(f"\tDiscovered explicit rule {filter.get('name','')}")
+                    filter_name = filter.get("name", "")
+                    logging.debug(f"\tDiscovered explicit rule {filter_name}")
                     sub_filters = list()
                     for subfilter in filter:
                         sub_filters.append(_parse_filter_element(subfilter))
@@ -82,16 +174,19 @@ def _extract_sysmon_rules(config: FileText) -> dict:
                         event_type=event_type,
                         onmatch=onmatch,
                         number=rule_number,
+                        name=filter_name,
                         filters=sub_filters,
                     )
                     logging.debug(f"\tFound rule: {rule}")
                 else:
                     # implied rules have a groupRelation of or
+                    filter_name = filter.get("name", "")
                     rule = Rule(
                         filter_relation="or",
                         event_type=event_type,
                         onmatch=onmatch,
                         number=rule_number,
+                        name=filter_name,
                         filters=[_parse_filter_element(filter)],
                     )
                     logging.debug(f"\tFound implied rule: {rule}")
@@ -110,12 +205,70 @@ def test(
     config: FileText = Argument(..., help="Valid Sysmon Config to extract rules from"),
     logfile: FileText = Argument(
         ...,
-        help="""JSONL of Windows Event Logs to test against, see [Security-Datasets](https://securitydatasets.com/introduction.html) for examples of valid JSONL files.""",
+        help="JSONL of Windows Event Logs to test against, see "
+        "[Security-Datasets](https://securitydatasets.com/introduction.html) for examples of valid JSONL files.",
+    ),
+    overruled: bool = Option(
+        False,
+        help=":construction: WIP :construction: Output rule matches that were overruled"
+        " - an unnamed rule hit before the named rule. Useful for detecting unorganized configs.",
+    ),
+    named_only: bool = Option(
+        False, help="Only output Events that have at least one named rule"
+    ),
+    filter_in: str = Option(
+        "",
+        help="Regular Expression to filter for. This uses re.match,"
+        " not str.contains, so you might need wild cards. Ex: --filter_in '.\*T1049.\*'",
     ),
 ):
-    # get rules
-    # read logs (one at a time? have a stream setting? might be good for large files)
-    # filter non-sysmon logs out (do this while reading)
-    # cross-reference eventid to eventtype
-    # run rule against every filter in include & exclude eventtype - should be able to add a 'passes' property to a rule and filter by taht
-    pass
+    """
+    Test the provided Sysmon config against a provided log file, with optional filtering options.
+
+
+    """
+    rules = _extract_sysmon_rules(config)
+    pattern = compile(filter_in) if filter_in else None
+    for line_num, line in enumerate(logfile, start=1):
+        event = json.loads(line)
+        # filter
+        event_id = event.get("EventID")
+        if event_id > 30:
+            continue
+        event_type = EVENT_LOOKUP[event_id]
+        line_rule_list = list()
+        # check includes
+        try:
+            include_rules: list[Rule] = rules[(event_type, "include")]
+            for rule in include_rules:
+                if rule.passes(event):
+                    line_rule_list.append(rule)
+        except KeyError:
+            pass
+        # check excludes
+        try:
+            exclude_rules = rules[(event_type, "exclude")]
+            for rule in exclude_rules:
+                if rule.passes(event):
+                    line_rule_list.append(rule)
+        except KeyError:
+            pass
+        if named_only:
+            # check for named rules
+            if not any(rule.name for rule in line_rule_list):
+                continue
+        if pattern:
+            if not any(match(pattern, rule.name) for rule in line_rule_list):
+                continue
+        console.print(f"Line {line_num} hit on {len(line_rule_list)} rules:")
+        [
+            console.print(
+                f"\t{rule.event_type}\t{rule.onmatch}\t#{rule.number}\t{rule.name}"
+            )
+            for rule in line_rule_list
+        ]
+
+
+@app.callback(invoke_without_command=True)
+def main():
+    console.print("Entered sysmon_main")
