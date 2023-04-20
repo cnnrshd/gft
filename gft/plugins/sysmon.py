@@ -1,12 +1,14 @@
 import json
 import logging
 from dataclasses import dataclass, field
+from enum import Enum
 from re import compile, match
+from typing import Iterator
 
 from config import config
 from lxml import etree
 from lxml.etree import Element, ElementTree
-from typer import Argument, FileText, Option, Typer
+from typer import Argument, FileText, FileTextWrite, Option, Typer
 
 console = config.console
 
@@ -195,19 +197,95 @@ def _extract_sysmon_rules(config: FileText) -> dict:
     return rules_dict
 
 
+# Arguments/Options definitions
+SYSMON_CONFIG: FileText = Argument(
+    ..., help="Valid Sysmon Config to extract rules from"
+)
+WEL_LOGFILE: FileText = Argument(
+    ...,
+    help="JSONL of Windows Event Logs to test against, see "
+    "[Security-Datasets](https://securitydatasets.com/introduction.html) for examples of valid JSONL files.",
+)
+OUTFILE: FileTextWrite = Option("-", help="File to output to.")
+
+
 @app.command(name="rules", help="Extract rules from a sysmon config")
-def rules(config: FileText):
+def rules(config: FileText = SYSMON_CONFIG):
     console.print(_extract_sysmon_rules(config))
+
+
+def _rule_generator(rules: list[Rule], event: dict) -> Iterator[Rule]:
+    """Simple generator that returns the first matching rule
+
+    Args:
+        rules (list[Rule]): List of rules to test against. Can be include or exclude
+        event (dict): A Sysmon event
+
+    Yields:
+        Iterator[Rule]: Iterator that generates passing rules.
+    """
+    for rule in rules:
+        if rule.passes(event):
+            yield rule
+
+
+@app.command(
+    name="emulate",
+    help="Emulate running a Sysmon config against a log file - Exclude all filtered events, set Event Name based on first-hit rule",
+)
+def emulate_sysmon(
+    config: FileText = SYSMON_CONFIG,
+    logfile: FileText = WEL_LOGFILE,
+    outfile: FileTextWrite = OUTFILE,
+):
+    rules = _extract_sysmon_rules(config)
+    for line in logfile:
+        event = json.loads(line)
+        # filter
+        event_id = event.get("EventID")
+        if event_id > len(EVENT_LOOKUP) - 1:
+            continue
+        event_type = EVENT_LOOKUP[event_id]
+        # check includes
+        try:
+            include_rules: list[Rule] = rules[(event_type, "include")]
+            if first_matching_rule := next(
+                (rule for rule in _rule_generator(include_rules, event)), None
+            ):
+                event["RuleName"] = first_matching_rule.name
+            else:
+                continue
+        except KeyError:  # No includes for this event type
+            continue
+        # check excludes
+        try:
+            exclude_rules = rules[(event_type, "exclude")]
+            if first_matching_rule := next(
+                (rule for rule in _rule_generator(exclude_rules, event)), None
+            ):
+                # it is excluded
+                continue
+        except KeyError:
+            pass
+
+        outfile.write(
+            json.dumps(
+                event,
+                indent=None,
+            )
+            + "\n"
+        )
+
+
+class OutputFormat(str, Enum):
+    json = "json"
+    terminal = "terminal"
 
 
 @app.command(name="test", help="Test a provided config against a provided log file")
 def test(
-    config: FileText = Argument(..., help="Valid Sysmon Config to extract rules from"),
-    logfile: FileText = Argument(
-        ...,
-        help="JSONL of Windows Event Logs to test against, see "
-        "[Security-Datasets](https://securitydatasets.com/introduction.html) for examples of valid JSONL files.",
-    ),
+    config: FileText = SYSMON_CONFIG,
+    logfile: FileText = WEL_LOGFILE,
     overruled: bool = Option(
         False,
         help=":construction: WIP :construction: Output rule matches that were overruled"
@@ -225,7 +303,7 @@ def test(
     """
     Test the provided Sysmon config against a provided log file, with optional filtering options.
 
-
+    Log files are parsed and outputted as a stream - one line at a time.
     """
     rules = _extract_sysmon_rules(config)
     pattern = compile(filter_in) if filter_in else None
